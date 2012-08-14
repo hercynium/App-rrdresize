@@ -1,0 +1,111 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use autodie;
+use RRDTool::OO;
+use XML::Twig;
+use Data::Dumper;
+
+my $orig_file = shift || die;
+my $new_file = shift || die;
+
+my $rrd_info = get_rrd_info($orig_file);
+
+# TODO: send this sub to the RRD::Editor maintainer as a new method.
+sub get_rrd_info {
+  my ($rrd_file) = @_;
+  my %info;
+  for my $line (qx{rrdtool info $rrd_file}) {
+    chomp $line;
+    my ($key, $val) = split '\s*=\s*', $line;
+    $val =~ s/^"(.*)"$/$1/;
+    my ($sec, $idx, $name) = ($key =~ /(\w+)(?:\[(\w+)\])?(?:\.(.*))?/);
+    if ($sec eq 'ds') {
+      $info{ds}{$idx}{$name} = $val;
+      next;
+    }
+    if ($sec eq 'rra') {
+      if (my ($cidx, $cvar) = ($name =~ /cdp_prep\[(\d+)\].(.*)/) ) {
+        $info{rra}[$idx]{cdp_prep}[$cidx]{$cvar} = $val;
+        next;
+      }
+      $info{rra}[$idx]{$name} = $val;
+      next;
+    }
+    $info{$key} = $val;
+  }
+  return wantarray ? %info : \%info;
+}
+
+my $FIVE_YEARS = 3600 * 24 * 365 * 5;
+my $NEW_STEP = 10;
+my $NEW_HB = 100;
+my @RRA_SIZES = (
+  [ 1    => 8640  ],
+  [ 6    => 10080 ],
+  [ 60   => 8640  ],
+  [ 360  => 8760  ],
+  [ 1440 => 10950 ],
+);
+
+my $x = -1;
+my @rra_defs = 
+  map {
+    $x++;
+    {
+      cfunc   => $_->{cf},
+      xff     => $_->{xff},
+      cpoints => $RRA_SIZES[$x]->[0],
+      rows    => $RRA_SIZES[$x]->[1],
+    }
+  }
+  @{ $rrd_info->{rra} };
+
+my @ds_defs =
+  map {
+    +{
+      name => $_->[0],
+      type => $_->[1]{type},
+      heartbeat => $FIVE_YEARS,
+    }
+  }
+  sort { $a->[1]{index} <=> $b->[1]{index} }
+  map { [ $_ => $rrd_info->{ds}{$_} ] }
+  keys %{ $rrd_info->{ds} };
+
+my @new_rrd_params = (
+  step => $NEW_STEP,
+  start => -$FIVE_YEARS,
+  (map { (data_source => $_) } @ds_defs),
+  (map { (archive => $_) } @rra_defs),
+);
+
+my $new_rrd = RRDTool::OO->new( file => $new_file );
+$new_rrd->create( @new_rrd_params ) || die "Couldn't create new RRD\n";
+
+my $twig= XML::Twig->new(
+  twig_handlers => {
+    row => \&process_rows,
+  },
+  comments => 'process',
+);
+
+my @data;
+sub process_rows {
+  my ($twig, $row) = @_;
+
+  my $timestamp = (split ' ', $row->prev_elt_trimmed_text('#COMMENT'))[-1];
+  my @values = map { 0+$_ } $row->children_trimmed_text('v');
+  push @data, [ $timestamp, @values ];
+}
+
+$twig->parse( scalar qx{rrdtool dump "$orig_file"} );
+
+open my $updater, '|-', <<"WHEEE";
+sort -r -g -u -k1,1 | tac | sed 's/ /:/g' | xargs rrdtool update $new_file
+WHEEE
+print $updater map { join( ' ', @$_ ) . "\n"  } @data;
+close $updater;
+
+system(qw{rrdtool tune}, $new_file, '-h', "$_:$NEW_HB") for keys %{ $rrd_info->{ds} };
+

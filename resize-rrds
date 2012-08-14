@@ -1,0 +1,15 @@
+#!/bin/bash
+
+set -e
+tar czf rrds.7.tar.gz rrds/
+
+find rrds/DUMMY -name '*.rrd' \
+| xargs -P8 -I{} bash -c '
+  set -e
+  echo "{}"
+  ./rrd-clone "{}" "{}.new"
+  mv -f "{}.new" "{}"
+  chown ganglia "{}"
+  chmod ug+rw "{}"
+'
+
